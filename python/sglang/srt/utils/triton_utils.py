@@ -19,6 +19,7 @@ import functools
 import importlib
 import inspect
 import logging
+import types
 from functools import lru_cache
 
 import triton
@@ -49,7 +50,45 @@ def next_power_of_2(n: int):
     return 1 << (n - 1).bit_length() if n > 0 else 1
 
 
-setattr(triton, "next_power_of_2", next_power_of_2)
+def _as_triton_constexpr_function(fn):
+    """Wrap ``fn`` so it can stand in for ``triton.next_power_of_2``.
+
+    Since Triton 3.5, ``triton.next_power_of_2`` is a ``constexpr_function`` that
+    ``@triton.jit`` and ``@gluon.jit`` code may call on constexpr arguments, and
+    Triton's code generator rejects plain Python functions
+    ("Unsupported function referenced"). The override is process-wide, so it
+    must stay a ``ConstexprFunction`` or every kernel that calls
+    ``triton.next_power_of_2`` stops compiling, including kernels outside SGLang.
+
+    Host calls on a plain ``int`` (SGLang's launch-side call sites) skip the
+    wrapper's constexpr argument unwrapping, which is most of its per-call cost.
+    """
+    constexpr_function = getattr(triton, "constexpr_function", None)
+    if constexpr_function is None:
+        # Triton < 3.5: upstream's helper is a plain host function as well.
+        return fn
+    wrapped = constexpr_function(fn)
+    if isinstance(wrapped, types.FunctionType):
+        # Triton stand-ins (e.g. the MPS stub) hand the function back unchanged.
+        return wrapped
+
+    class _HostFastPath(type(wrapped)):
+        def __call__(self, *args, _semantic=None, **kwargs):
+            if (
+                _semantic is None
+                and not kwargs
+                and len(args) == 1
+                and type(args[0]) is int
+            ):
+                return fn(args[0])
+            return super().__call__(*args, _semantic=_semantic, **kwargs)
+
+    return _HostFastPath(fn)
+
+
+# Keep the override so SGLang's call sites see the same results as before
+# (``1`` for ``n <= 0``, where upstream returns ``0``), in a form kernels can call.
+setattr(triton, "next_power_of_2", _as_triton_constexpr_function(next_power_of_2))
 
 
 @lru_cache(maxsize=1)
